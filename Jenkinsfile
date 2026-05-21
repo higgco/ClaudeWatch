@@ -20,26 +20,22 @@ pipeline {
         script {
           def envConfig = [
             development: [
-              profile:    'sac-dev',
-              accountId:  '753025320351',
-              cluster:    'sac-development'
+              profile:   'sac-dev',
+              accountId: '753025320351'
             ],
             staging: [
-              profile:    'sac-staging',
-              accountId:  '', // TODO: add staging account ID when environment is provisioned
-              cluster:    'sac-staging'
+              profile:   'sac-staging',
+              accountId: '' // TODO: add when environment is provisioned
             ],
             production: [
-              profile:    'sac-prod',
-              accountId:  '', // TODO: add production account ID when environment is provisioned
-              cluster:    'sac-production'
+              profile:   'sac-prod',
+              accountId: '' // TODO: add when environment is provisioned
             ]
           ]
 
           def cfg = envConfig[params.ENVIRONMENT]
           env.AWS_PROFILE  = cfg.profile
           env.ACCOUNT_ID   = cfg.accountId
-          env.CLUSTER      = cfg.cluster
           env.ECR_REGISTRY = "${cfg.accountId}.dkr.ecr.${env.REGION}.amazonaws.com"
           env.ECR_REPO     = "${env.ECR_REGISTRY}/${env.SERVICE_NAME}-${params.ENVIRONMENT}"
           env.SERVICE      = "${env.SERVICE_NAME}-${params.ENVIRONMENT}"
@@ -50,7 +46,7 @@ pipeline {
 
     stage('Build') {
       steps {
-        sh "docker build -t ${SERVICE_NAME}:${IMAGE_TAG} ."
+        sh "docker build --platform linux/amd64 -t ${SERVICE_NAME}:${IMAGE_TAG} ."
       }
     }
 
@@ -69,14 +65,33 @@ pipeline {
 
     stage('Deploy') {
       steps {
-        sh """
-          aws ecs update-service \
-            --cluster ${CLUSTER} \
-            --service ${SERVICE} \
-            --force-new-deployment \
-            --profile ${AWS_PROFILE} \
-            --region ${REGION}
-        """
+        script {
+          def instanceId = sh(
+            script: """
+              aws ec2 describe-instances \
+                --filters 'Name=tag:Name,Values=${env.SERVICE}' 'Name=instance-state-name,Values=running' \
+                --query 'Reservations[0].Instances[0].InstanceId' \
+                --output text \
+                --region ${env.REGION} \
+                --profile ${env.AWS_PROFILE}
+            """,
+            returnStdout: true
+          ).trim()
+
+          if (!instanceId || instanceId == 'None') {
+            error "No running instance found for ${env.SERVICE}"
+          }
+
+          sh """
+            aws ssm send-command \
+              --instance-ids '${instanceId}' \
+              --document-name 'AWS-RunShellScript' \
+              --parameters 'commands=["cd /opt/claudewatch && aws ecr get-login-password --region ${env.REGION} | docker login --username AWS --password-stdin ${env.ECR_REGISTRY} && docker compose pull app && docker compose up -d app"]' \
+              --timeout-seconds 120 \
+              --region ${env.REGION} \
+              --profile ${env.AWS_PROFILE}
+          """
+        }
       }
     }
   }
