@@ -4,6 +4,8 @@ services:
     image: ${ECR_REPO:-claudewatch}:latest
     restart: unless-stopped
     env_file: .env
+    cap_add:
+      - NET_BIND_SERVICE
     volumes:
       - app_data:/app/data
     networks:
