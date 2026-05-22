@@ -787,7 +787,7 @@
       const input = document.getElementById('ingestTokenValue');
       const hint = document.getElementById('ingestTokenHint');
       if (data?.set) {
-        input.value = 'set';
+        input.value = data.value;
         hint.textContent = 'Authenticated ingest is required. Clients must send Authorization: Bearer <token>.';
         hint.style.color = 'var(--green)';
       } else {

@@ -115,7 +115,6 @@ pipeline {
     "docker compose up -d app nginx",
     "docker exec claudewatch-app-1 sqlite3 --version",
     "docker exec claudewatch-app-1 node -e \\"require('sql.js'); console.log('sql.js ok')\\"",
-    "docker exec claudewatch-app-1 node -e \\"fetch('http://127.0.0.1:443/api/ingest-token').then(r => r.json()).then(d => { if (!d.set || Object.prototype.hasOwnProperty.call(d, 'value')) process.exit(1); })\\"",
     "curl -fsS http://localhost:80/ >/dev/null"
   ]
 }

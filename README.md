@@ -25,7 +25,6 @@ Configure your team's Claude Code instances to export telemetry to this server. 
 // In your Claude Code managed settings or .claude/settings.json:
 {
   "env": {
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://your-server:3456",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
     "OTEL_LOGS_EXPORTER": "otlp"
@@ -39,7 +38,6 @@ Or export them directly:
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://your-server:3456"
 export OTEL_EXPORTER_OTLP_PROTOCOL="http/json"
 export OTEL_LOGS_EXPORTER="otlp"
-export CLAUDE_CODE_ENABLE_TELEMETRY=1
 ```
 
 Claude Code will then POST events to `http://your-server:3456/v1/logs` in OTLP JSON format.
@@ -64,7 +62,6 @@ Or in managed settings:
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://your-server:3456",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
     "OTEL_LOGS_EXPORTER": "otlp",
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer some-long-random-string"
   }
 }
