@@ -29,6 +29,9 @@ router.get("/stats/summary", async (req, res) => {
   const { from, to, source } = req.query;
   const audience = await parseAudience(db, req);
   const wc = whereClause(from, to, audience, source);
+  // user_prompts / api_errors have no `source` column, so reuse a source-less
+  // clause for them — applying the source filter there throws "no such column".
+  const wcNoSrc = whereClause(from, to, audience, null, "user_prompts");
 
   const totalCost = scalar(db,
     `SELECT COALESCE(SUM(cost_usd), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
@@ -39,9 +42,9 @@ router.get("/stats/summary", async (req, res) => {
   const totalTokensOut = scalar(db,
     `SELECT COALESCE(SUM(output_tokens), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
   const totalPrompts = scalar(db,
-    `SELECT COUNT(*) AS v FROM user_prompts ${wc.sql}`, wc.params);
+    `SELECT COUNT(*) AS v FROM user_prompts ${wcNoSrc.sql}`, wcNoSrc.params);
   const totalErrors = scalar(db,
-    `SELECT COUNT(*) AS v FROM api_errors ${wc.sql}`, wc.params);
+    `SELECT COUNT(*) AS v FROM api_errors ${wcNoSrc.sql}`, wcNoSrc.params);
   const uniqueUsers = scalar(db,
     `SELECT COUNT(DISTINCT user_email) AS v FROM api_requests ${wc.sql}`, wc.params);
   const uniqueSessions = scalar(db,
@@ -110,9 +113,12 @@ router.get("/stats/by-user", async (req, res) => {
      GROUP BY user_email
      ORDER BY cost DESC`, wc.params);
 
-  // Determine top model per user (most tokens in the same window, including cache)
+  // Per-user, per-model breakdown — drives both the "top model" column and the
+  // expandable per-model sub-rows in the Usage by user table.
   const modelRows = query(db,
     `SELECT user_email, model,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost,
             SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
                 + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)) AS total_tokens
      FROM api_requests ${wc.sql}
@@ -120,15 +126,24 @@ router.get("/stats/by-user", async (req, res) => {
      ORDER BY user_email, total_tokens DESC`, wc.params);
 
   const topModelByUser = {};
+  const modelsByUser = {};
   for (const r of modelRows) {
     if (!topModelByUser[r.user_email]) {
       topModelByUser[r.user_email] = { model: r.model, tokens: r.total_tokens };
     }
+    if (!modelsByUser[r.user_email]) modelsByUser[r.user_email] = [];
+    modelsByUser[r.user_email].push({
+      model: r.model,
+      requests: r.requests,
+      cost: r.cost,
+      total_tokens: r.total_tokens,
+    });
   }
   for (const r of rows) {
     const tm = topModelByUser[r.user_email];
     r.top_model = tm?.model || null;
     r.top_model_tokens = tm?.tokens || 0;
+    r.models = modelsByUser[r.user_email] || [];
   }
 
   await maskRows(rows);
@@ -224,7 +239,8 @@ router.get("/sessions", async (req, res) => {
             COUNT(*) AS requests,
             SUM(cost_usd) AS cost,
             SUM(input_tokens) AS input_tokens,
-            SUM(output_tokens) AS output_tokens
+            SUM(output_tokens) AS output_tokens,
+            GROUP_CONCAT(DISTINCT model) AS models
      FROM api_requests ${wc.sql}
      GROUP BY session_id
      ORDER BY started DESC
@@ -354,7 +370,25 @@ router.get("/plan-config", async (req, res) => {
   const db = await getDb();
   const rows = query(db, "SELECT * FROM plan_config LIMIT 1");
   const apiKey = await getAdminApiKey();
-  const members = query(db, "SELECT email, name, seat_tier, status, imported_at FROM org_members ORDER BY name");
+  // Unify imported org_members with any user we've seen in telemetry so the
+  // settings page can flip billing_model on users that were never CSV-imported.
+  const members = query(db, `
+    SELECT email, name, seat_tier, billing_model, status, imported_at, source
+    FROM (
+      SELECT email, name, seat_tier,
+             COALESCE(billing_model, 'seat') AS billing_model,
+             status, imported_at, 'imported' AS source
+      FROM org_members
+      UNION
+      SELECT DISTINCT ar.user_email AS email, NULL AS name, NULL AS seat_tier,
+             'seat' AS billing_model, NULL AS status, NULL AS imported_at,
+             'telemetry' AS source
+      FROM api_requests ar
+      WHERE ar.user_email IS NOT NULL
+        AND LOWER(ar.user_email) NOT IN (SELECT LOWER(email) FROM org_members)
+    )
+    ORDER BY COALESCE(name, email)
+  `);
   res.json({
     plan: rows[0] || null,
     hasAdminApiKey: !!apiKey,
@@ -368,24 +402,51 @@ router.post("/plan-config", async (req, res) => {
     billing_cycle_day = 1,
     standard_seat_cost_usd = 20,
     premium_seat_cost_usd = 100,
+    standard_seat_included_usd = null,
+    standard_seat_overage_pct = 0,
+    premium_seat_included_usd = null,
+    premium_seat_overage_pct = 0,
+    commitment_amount_usd = null,
+    commitment_start_date = null,
+    commitment_end_date = null,
+    commitment_discount_pct = 0,
     admin_api_key,
   } = req.body || {};
 
   const now = new Date().toISOString();
   const existing = query(db, "SELECT id FROM plan_config LIMIT 1");
   const day = Math.min(28, Math.max(1, billing_cycle_day));
+  const commitAmt = commitment_amount_usd === null || commitment_amount_usd === "" ? null : Number(commitment_amount_usd);
+  const discount = Math.min(100, Math.max(0, Number(commitment_discount_pct) || 0));
+  const startDate = commitment_start_date || null;
+  const endDate = commitment_end_date || null;
+  const stdIncluded = standard_seat_included_usd === null || standard_seat_included_usd === "" ? null : Number(standard_seat_included_usd);
+  const premIncluded = premium_seat_included_usd === null || premium_seat_included_usd === "" ? null : Number(premium_seat_included_usd);
+  const stdOver = Math.min(100, Math.max(0, Number(standard_seat_overage_pct) || 0));
+  const premOver = Math.min(100, Math.max(0, Number(premium_seat_overage_pct) || 0));
 
   if (existing.length > 0) {
     db.run(
       `UPDATE plan_config SET billing_cycle_day=?, standard_seat_cost_usd=?,
-       premium_seat_cost_usd=?, updated_at=? WHERE id=?`,
-      [day, standard_seat_cost_usd, premium_seat_cost_usd, now, existing[0].id]
+       premium_seat_cost_usd=?, standard_seat_included_usd=?, standard_seat_overage_pct=?,
+       premium_seat_included_usd=?, premium_seat_overage_pct=?,
+       commitment_amount_usd=?, commitment_start_date=?,
+       commitment_end_date=?, commitment_discount_pct=?, updated_at=? WHERE id=?`,
+      [day, standard_seat_cost_usd, premium_seat_cost_usd,
+       stdIncluded, stdOver, premIncluded, premOver,
+       commitAmt, startDate, endDate, discount, now, existing[0].id]
     );
   } else {
     db.run(
       `INSERT INTO plan_config (billing_cycle_day, standard_seat_cost_usd,
-       premium_seat_cost_usd, created_at, updated_at) VALUES (?,?,?,?,?)`,
-      [day, standard_seat_cost_usd, premium_seat_cost_usd, now, now]
+       premium_seat_cost_usd, standard_seat_included_usd, standard_seat_overage_pct,
+       premium_seat_included_usd, premium_seat_overage_pct,
+       commitment_amount_usd, commitment_start_date,
+       commitment_end_date, commitment_discount_pct, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [day, standard_seat_cost_usd, premium_seat_cost_usd,
+       stdIncluded, stdOver, premIncluded, premOver,
+       commitAmt, startDate, endDate, discount, now, now]
     );
   }
 
@@ -393,6 +454,55 @@ router.post("/plan-config", async (req, res) => {
     await setAdminApiKey(admin_api_key);
   }
 
+  persist();
+  res.json({ ok: true });
+});
+
+// Upsert a single member's billing_model and/or seat_tier from the Settings UI.
+// If the email hasn't been CSV-imported yet (just seen in telemetry), we create
+// an org_members row on the fly so the choice sticks. Either field may be
+// omitted to leave it unchanged.
+router.patch("/members/:email", async (req, res) => {
+  const incoming = decodeURIComponent(req.params.email);
+  const body = req.body || {};
+  const updates = {};
+
+  if (body.billing_model !== undefined) {
+    const bm = String(body.billing_model).toLowerCase();
+    if (!["seat", "enterprise"].includes(bm)) {
+      return res.status(400).json({ error: "billing_model must be 'seat' or 'enterprise'" });
+    }
+    updates.billing_model = bm;
+  }
+  if (body.seat_tier !== undefined) {
+    const t = String(body.seat_tier);
+    if (!["Standard", "Premium"].includes(t)) {
+      return res.status(400).json({ error: "seat_tier must be 'Standard' or 'Premium'" });
+    }
+    updates.seat_tier = t;
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: "No update fields provided" });
+  }
+
+  const db = await getDb();
+  const email = await unmaskFilter(incoming);
+  const now = new Date().toISOString();
+  db.run(
+    `INSERT INTO org_members (email, billing_model, seat_tier, imported_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET
+       billing_model = COALESCE(?, org_members.billing_model),
+       seat_tier     = COALESCE(?, org_members.seat_tier)`,
+    [
+      email,
+      updates.billing_model || 'seat',
+      updates.seat_tier || null,
+      now,
+      updates.billing_model ?? null,
+      updates.seat_tier ?? null,
+    ]
+  );
   persist();
   res.json({ ok: true });
 });
@@ -409,7 +519,7 @@ router.post("/members/import", express.text({ type: "text/csv", limit: "1mb" }),
   const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
   const col = (name) => headers.indexOf(name);
   const iName = col("name"), iEmail = col("email"), iRole = col("role");
-  const iStatus = col("status"), iTier = col("seat tier");
+  const iStatus = col("status"), iTier = col("seat tier"), iModel = col("billing model");
 
   if (iEmail === -1) return res.status(400).json({ error: "CSV missing Email column" });
 
@@ -422,26 +532,36 @@ router.post("/members/import", express.text({ type: "text/csv", limit: "1mb" }),
     const email = cells[iEmail];
     if (!email) continue;
 
+    // billing_model: only override existing values when the CSV column was provided
+    // AND non-empty, so UI edits aren't clobbered by a re-import that omits the column.
+    const rawModel = iModel >= 0 ? (cells[iModel] || "").trim().toLowerCase() : "";
+    const csvProvidedModel = iModel >= 0 && rawModel !== "";
+    const billingModel = rawModel === "enterprise" ? "enterprise" : "seat";
+
     db.run(
-      `INSERT INTO org_members (email, name, role, status, seat_tier, imported_at)
-       VALUES (?,?,?,?,?,?)
+      `INSERT INTO org_members (email, name, role, status, seat_tier, billing_model, imported_at)
+       VALUES (?,?,?,?,?,?,?)
        ON CONFLICT(email) DO UPDATE SET
          name=excluded.name, role=excluded.role, status=excluded.status,
-         seat_tier=excluded.seat_tier, imported_at=excluded.imported_at`,
+         seat_tier=excluded.seat_tier,
+         billing_model=CASE WHEN ? = 1 THEN excluded.billing_model ELSE org_members.billing_model END,
+         imported_at=excluded.imported_at`,
       [
         email,
         iName >= 0 ? cells[iName] || null : null,
         iRole >= 0 ? cells[iRole] || null : null,
         iStatus >= 0 ? cells[iStatus] || null : null,
         iTier >= 0 ? cells[iTier] || null : null,
+        billingModel,
         now,
+        csvProvidedModel ? 1 : 0,
       ]
     );
     upserted++;
   }
 
   persist();
-  const members = query(db, "SELECT email, name, seat_tier, status, imported_at FROM org_members ORDER BY name");
+  const members = query(db, "SELECT email, name, seat_tier, billing_model, status, imported_at FROM org_members ORDER BY name");
   res.json({ ok: true, upserted, members });
 });
 
@@ -452,35 +572,15 @@ router.get("/stats/session-windows", async (req, res) => {
   const audience = await parseAudience(db, req);
   const wc = whereClause(from, to, audience, source);
 
-  const windows = query(db, `
-    WITH ordered AS (
-      SELECT timestamp, user_email, cost_usd, input_tokens, output_tokens,
-        ROUND((julianday(timestamp) - julianday(
-          LAG(timestamp) OVER (PARTITION BY user_email ORDER BY timestamp)
-        )) * 86400) AS gap_seconds
-      FROM api_requests ${wc.sql}
-    ),
-    windowed AS (
-      SELECT *,
-        SUM(CASE WHEN gap_seconds IS NULL OR gap_seconds > 18000 THEN 1 ELSE 0 END)
-          OVER (PARTITION BY user_email ORDER BY timestamp) AS window_id
-      FROM ordered
-    )
-    SELECT user_email, window_id,
-      MIN(timestamp) AS window_start, MAX(timestamp) AS window_end,
-      COUNT(*) AS request_count,
-      ROUND(SUM(cost_usd), 6) AS total_cost,
-      SUM(input_tokens) AS total_input_tokens,
-      SUM(output_tokens) AS total_output_tokens,
-      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) AS total_tokens,
-      ROUND((julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24, 4) AS duration_hours
-    FROM windowed
-    GROUP BY user_email, window_id
-    ORDER BY window_start DESC
-  `, wc.params);
+  // Roll requests up to 5-hour (18000s) gap-based windows per user, then
+  // aggregate those windows to per-user totals — all in SQL. We deliberately
+  // do NOT return the raw per-window rows (thousands of them); the dashboard
+  // only needs per-user rollups + a global summary, so shipping every window
+  // is what previously ballooned memory and payload size.
+  const perUser = query(db, windowStatsSql(wc.sql, 18000), wc.params);
 
-  await maskRows(windows);
-  res.json(computeSessionWindowStats(windows));
+  await maskRows(perUser);
+  res.json({ summary: computeWindowSummary(perUser), per_user: perUser });
 });
 
 // ── Billing period summary (informational, no overage guessing) ─────────────
@@ -491,14 +591,21 @@ router.get("/stats/billing-summary", async (req, res) => {
     billing_cycle_day: 1,
     standard_seat_cost_usd: 20,
     premium_seat_cost_usd: 100,
+    commitment_amount_usd: null,
+    commitment_start_date: null,
+    commitment_end_date: null,
+    commitment_discount_pct: 0,
   };
   const period = getBillingPeriod(config.billing_cycle_day);
+  const discountFactor = 1 - (Number(config.commitment_discount_pct) || 0) / 100;
 
-  // Per-user spend in this billing period
+  // Per-user spend in this billing period (seat users keep the prorated-plan
+  // calc on the client; enterprise users contribute to the commitment pool)
   const byUser = query(db,
     `SELECT ar.user_email,
             COALESCE(m.name, ar.user_email) AS name,
             COALESCE(m.seat_tier, 'Standard') AS seat_tier,
+            COALESCE(m.billing_model, 'seat') AS billing_model,
             SUM(ar.cost_usd) AS api_equivalent_cost,
             COUNT(*) AS requests,
             SUM(COALESCE(ar.input_tokens,0) + COALESCE(ar.output_tokens,0)) AS tokens
@@ -513,6 +620,58 @@ router.get("/stats/billing-summary", async (req, res) => {
   for (const u of byUser) {
     totalCost += u.api_equivalent_cost || 0;
     totalTokens += u.tokens || 0;
+    // Effective cost = list × (1 - discount). Only meaningful for enterprise
+    // users (seat users get the prorated-plan calc instead) but cheap to compute.
+    u.effective_cost = Math.round((u.api_equivalent_cost || 0) * discountFactor * 10000) / 10000;
+  }
+
+  // Commitment pool: list-price cost across only enterprise-billed users in
+  // the configured commitment window (falls back to the billing period if
+  // commitment dates aren't set, so the UI still has something to show).
+  let commitment = null;
+  if (config.commitment_amount_usd && config.commitment_amount_usd > 0) {
+    const start = config.commitment_start_date || period.start.slice(0, 10);
+    const end = config.commitment_end_date || period.end.slice(0, 10);
+    const startIso = start.length === 10 ? start + "T00:00:00.000Z" : start;
+    const endIso = end.length === 10 ? end + "T23:59:59.999Z" : end;
+
+    const poolRow = query(db,
+      `SELECT COALESCE(SUM(ar.cost_usd), 0) AS list_cost
+       FROM api_requests ar
+       LEFT JOIN org_members m ON LOWER(ar.user_email) = LOWER(m.email)
+       WHERE ar.timestamp >= ? AND ar.timestamp < ?
+         AND COALESCE(m.billing_model, 'seat') = 'enterprise'`,
+      [startIso, endIso])[0] || { list_cost: 0 };
+
+    const consumedEffective = (poolRow.list_cost || 0) * discountFactor;
+    const startDate = new Date(startIso);
+    const endDate = new Date(endIso);
+    const now = new Date();
+    const msPerDay = 86400000;
+    const totalDays = Math.max(1, Math.round((endDate - startDate) / msPerDay));
+    const daysElapsed = Math.max(0, Math.min(totalDays, Math.round((now - startDate) / msPerDay)));
+    const daysRemaining = Math.max(0, totalDays - daysElapsed);
+    const expectedSoFar = (config.commitment_amount_usd * daysElapsed) / totalDays;
+
+    commitment = {
+      amount_usd: config.commitment_amount_usd,
+      discount_pct: Number(config.commitment_discount_pct) || 0,
+      start: startIso,
+      end: endIso,
+      list_consumed: Math.round((poolRow.list_cost || 0) * 100) / 100,
+      consumed: Math.round(consumedEffective * 100) / 100,
+      remaining: Math.round((config.commitment_amount_usd - consumedEffective) * 100) / 100,
+      pct_consumed: config.commitment_amount_usd > 0
+        ? Math.round((consumedEffective / config.commitment_amount_usd) * 1000) / 10
+        : 0,
+      total_days: totalDays,
+      days_elapsed: daysElapsed,
+      days_remaining: daysRemaining,
+      expected_so_far: Math.round(expectedSoFar * 100) / 100,
+      // Positive = ahead of pace (burning faster than commitment supports);
+      // negative = behind pace (risk of under-utilising the commit).
+      pace_delta: Math.round((consumedEffective - expectedSoFar) * 100) / 100,
+    };
   }
 
   // Mask both user_email and the joined-from-org_members `name` so privacy
@@ -524,7 +683,14 @@ router.get("/stats/billing-summary", async (req, res) => {
     seat_costs: {
       standard: config.standard_seat_cost_usd,
       premium: config.premium_seat_cost_usd,
+      // included_usd defaults to the base seat cost when unset, matching the
+      // "no overage" assumption (subscription covers exactly what you pay for).
+      standard_included: config.standard_seat_included_usd ?? config.standard_seat_cost_usd,
+      premium_included: config.premium_seat_included_usd ?? config.premium_seat_cost_usd,
+      standard_overage_pct: config.standard_seat_overage_pct ?? 0,
+      premium_overage_pct: config.premium_seat_overage_pct ?? 0,
     },
+    commitment,
     total_api_equivalent_cost: Math.round(totalCost * 100) / 100,
     total_tokens: totalTokens,
     by_user: byUser,
@@ -538,37 +704,12 @@ router.get("/stats/weekly-windows", async (req, res) => {
   const audience = await parseAudience(db, req);
   const wc = whereClause(from, to, audience, source);
 
-  // Group requests into 7-day (168-hour) rolling windows per user,
-  // using same gap-based approach as 5-hour windows but with 7-day threshold
-  const windows = query(db, `
-    WITH ordered AS (
-      SELECT timestamp, user_email, cost_usd, input_tokens, output_tokens,
-        ROUND((julianday(timestamp) - julianday(
-          LAG(timestamp) OVER (PARTITION BY user_email ORDER BY timestamp)
-        )) * 86400) AS gap_seconds
-      FROM api_requests ${wc.sql}
-    ),
-    windowed AS (
-      SELECT *,
-        SUM(CASE WHEN gap_seconds IS NULL OR gap_seconds > 604800 THEN 1 ELSE 0 END)
-          OVER (PARTITION BY user_email ORDER BY timestamp) AS window_id
-      FROM ordered
-    )
-    SELECT user_email, window_id,
-      MIN(timestamp) AS window_start, MAX(timestamp) AS window_end,
-      COUNT(*) AS request_count,
-      ROUND(SUM(cost_usd), 6) AS total_cost,
-      SUM(input_tokens) AS total_input_tokens,
-      SUM(output_tokens) AS total_output_tokens,
-      SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) AS total_tokens,
-      ROUND((julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24, 4) AS duration_hours
-    FROM windowed
-    GROUP BY user_email, window_id
-    ORDER BY window_start DESC
-  `, wc.params);
+  // Same gap-based approach as the 5-hour windows but with a 7-day (604800s)
+  // threshold, aggregated to per-user totals in SQL (see session-windows note).
+  const perUser = query(db, windowStatsSql(wc.sql, 604800), wc.params);
 
-  await maskRows(windows);
-  res.json(computeSessionWindowStats(windows));
+  await maskRows(perUser);
+  res.json({ summary: computeWindowSummary(perUser), per_user: perUser });
 });
 
 // ── Admin API proxies ───────────────────────────────────────────────────────
@@ -944,39 +1085,71 @@ function getBillingPeriod(cycleDayOfMonth) {
   };
 }
 
-function computeSessionWindowStats(windows) {
-  if (windows.length === 0) {
-    return { windows: [], summary: {
-      total_windows: 0, avg_cost_per_window: 0, avg_tokens_per_window: 0,
-      avg_requests_per_window: 0, avg_duration_hours: 0,
-      avg_cost_per_active_hour: null, total_cost: 0, total_active_hours: 0,
-    }};
+// Build the gap-based windowing query for a given gap threshold (seconds),
+// rolled up to ONE ROW PER USER. The inner per_window CTE groups requests into
+// windows (a new window starts whenever the gap since the previous request for
+// that user exceeds gapSeconds); the outer select then aggregates each user's
+// windows into the rollup the dashboard actually consumes.
+function windowStatsSql(whereSql, gapSeconds) {
+  return `
+    WITH ordered AS (
+      SELECT timestamp, user_email, cost_usd, input_tokens, output_tokens,
+        ROUND((julianday(timestamp) - julianday(
+          LAG(timestamp) OVER (PARTITION BY user_email ORDER BY timestamp)
+        )) * 86400) AS gap_seconds
+      FROM api_requests ${whereSql}
+    ),
+    windowed AS (
+      SELECT *,
+        SUM(CASE WHEN gap_seconds IS NULL OR gap_seconds > ${gapSeconds} THEN 1 ELSE 0 END)
+          OVER (PARTITION BY user_email ORDER BY timestamp) AS window_id
+      FROM ordered
+    ),
+    per_window AS (
+      SELECT user_email, window_id,
+        SUM(cost_usd) AS total_cost,
+        SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) AS total_tokens,
+        COUNT(*) AS request_count,
+        (julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24 AS duration_hours
+      FROM windowed
+      GROUP BY user_email, window_id
+    )
+    SELECT user_email,
+      COUNT(*) AS window_count,
+      ROUND(SUM(total_cost), 6) AS total_cost,
+      SUM(total_tokens) AS total_tokens,
+      SUM(request_count) AS total_requests,
+      ROUND(SUM(duration_hours), 4) AS total_hours
+    FROM per_window
+    GROUP BY user_email
+    ORDER BY total_cost DESC
+  `;
+}
+
+// Derive the global summary from the per-user rollups (≈55 rows). Note that
+// active-hours and total-hours are identical here: zero-duration windows
+// contribute 0 either way, so there's no need to track them separately.
+function computeWindowSummary(perUser) {
+  let totalWindows = 0, totalCost = 0, totalTokens = 0, totalRequests = 0, totalActiveHours = 0;
+  for (const u of perUser) {
+    totalWindows += u.window_count || 0;
+    totalCost += u.total_cost || 0;
+    totalTokens += u.total_tokens || 0;
+    totalRequests += u.total_requests || 0;
+    totalActiveHours += u.total_hours || 0;
   }
-
-  const n = windows.length;
-  const totalCost = windows.reduce((s, w) => s + (w.total_cost || 0), 0);
-  const totalTokens = windows.reduce((s, w) => s + (w.total_tokens || 0), 0);
-  const totalRequests = windows.reduce((s, w) => s + w.request_count, 0);
-  const totalActiveHours = windows.reduce((s, w) => s + (w.duration_hours || 0), 0);
-
-  const activeHoursForVelocity = windows
-    .filter(w => w.duration_hours > 0)
-    .reduce((s, w) => s + w.duration_hours, 0);
-
+  const n = totalWindows;
   return {
-    windows,
-    summary: {
-      total_windows: n,
-      avg_cost_per_window: totalCost / n,
-      avg_tokens_per_window: Math.round(totalTokens / n),
-      avg_requests_per_window: Math.round(totalRequests / n),
-      avg_duration_hours: Math.round((totalActiveHours / n) * 100) / 100,
-      avg_cost_per_active_hour: activeHoursForVelocity > 0
-        ? Math.round((totalCost / activeHoursForVelocity) * 100) / 100
-        : null,
-      total_cost: Math.round(totalCost * 100) / 100,
-      total_active_hours: Math.round(totalActiveHours * 100) / 100,
-    },
+    total_windows: n,
+    avg_cost_per_window: n ? totalCost / n : 0,
+    avg_tokens_per_window: n ? Math.round(totalTokens / n) : 0,
+    avg_requests_per_window: n ? Math.round(totalRequests / n) : 0,
+    avg_duration_hours: n ? Math.round((totalActiveHours / n) * 100) / 100 : 0,
+    avg_cost_per_active_hour: totalActiveHours > 0
+      ? Math.round((totalCost / totalActiveHours) * 100) / 100
+      : null,
+    total_cost: Math.round(totalCost * 100) / 100,
+    total_active_hours: Math.round(totalActiveHours * 100) / 100,
   };
 }
 
