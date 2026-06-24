@@ -68,7 +68,7 @@ pipeline {
       steps {
         sh '''
           docker run --rm --entrypoint sh "$LOCAL_IMAGE" -lc 'sqlite3 --version'
-          docker run --rm --entrypoint node "$LOCAL_IMAGE" -e "require('sql.js'); console.log('sql.js ok')"
+          docker run --rm --entrypoint node "$LOCAL_IMAGE" -e "require('better-sqlite3'); console.log('better-sqlite3 ok')"
         '''
       }
     }
@@ -114,7 +114,7 @@ pipeline {
     "docker compose pull app",
     "docker compose up -d app nginx",
     "docker exec claudewatch-app-1 sqlite3 --version",
-    "docker exec claudewatch-app-1 node -e \\"require('sql.js'); console.log('sql.js ok')\\"",
+    "docker exec claudewatch-app-1 node -e \\"require('better-sqlite3'); console.log('better-sqlite3 ok')\\"",
     "curl -fsS http://localhost:80/ >/dev/null"
   ]
 }
