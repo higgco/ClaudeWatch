@@ -225,6 +225,41 @@ router.get("/events/recent", async (req, res) => {
   res.json(rows);
 });
 
+// ── CSV export of filtered api_requests ─────────────────────────────────────
+router.get("/export.csv", async (req, res) => {
+  const db = await getDb();
+  const { from, to, source } = req.query;
+  const audience = await parseAudience(db, req);
+  const wc = whereClause(from, to, audience, source);
+
+  const rows = query(db,
+    `SELECT timestamp, user_email, session_id, prompt_id, model, source,
+            cost_usd, input_tokens, output_tokens, cache_read_tokens,
+            cache_creation_tokens, duration_ms
+     FROM api_requests ${wc.sql}
+     ORDER BY timestamp`, wc.params);
+  await maskRows(rows);
+
+  const cols = [
+    "timestamp", "user_email", "session_id", "prompt_id", "model", "source",
+    "cost_usd", "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_creation_tokens", "duration_ms",
+  ];
+  const esc = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = [cols.join(",")]
+    .concat(rows.map(r => cols.map(c => esc(r[c])).join(",")))
+    .join("\r\n");
+
+  const range = `${(from || "start").slice(0, 10)}_${(to || "now").slice(0, 10)}`;
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="claude-usage_${range}.csv"`);
+  res.send(csv);
+});
+
 // ── Sessions list ───────────────────────────────────────────────────────────
 router.get("/sessions", async (req, res) => {
   const db = await getDb();

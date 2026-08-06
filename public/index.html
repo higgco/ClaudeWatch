@@ -79,6 +79,14 @@
     }
     .filters button:hover { background: var(--accent2); }
 
+    .filters button.ghost {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 6px 8px;
+    }
+    .filters button.ghost:hover { background: var(--border); color: var(--text); }
+
     .multi-select { position: relative; }
     .ms-trigger {
       background: var(--surface2);
@@ -552,6 +560,9 @@
       <input type="date" id="filterFrom">
       <label>To</label>
       <input type="date" id="filterTo">
+      <button type="button" class="ghost" onclick="setRange(30)">30d</button>
+      <button type="button" class="ghost" onclick="setRange(90)">90d</button>
+      <button type="button" class="ghost" onclick="setRange(null)" title="Show all data">All</button>
       <label>Audience</label>
       <div class="multi-select" id="filterAudience">
         <button type="button" class="ms-trigger" id="filterAudienceTrigger">All</button>
@@ -576,6 +587,7 @@
         <option value="opencode">OpenCode</option>
       </select>
       <button onclick="refresh()">Apply</button>
+      <button type="button" class="ghost" onclick="exportCsv()" title="Download the currently filtered API requests as CSV">Export CSV</button>
       <a class="gear-btn" href="/settings.html" title="Settings">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
       </a>
@@ -718,6 +730,25 @@
       return res.json();
     }
 
+    // Quick range presets. null = all time (clears both bounds).
+    function setRange(days) {
+      const fromEl = document.getElementById('filterFrom');
+      const toEl = document.getElementById('filterTo');
+      if (days == null) {
+        fromEl.value = '';
+        toEl.value = '';
+      } else {
+        const now = new Date();
+        toEl.value = now.toISOString().slice(0, 10);
+        fromEl.value = new Date(now - days * 86400000).toISOString().slice(0, 10);
+      }
+      refresh();
+    }
+
+    function exportCsv() {
+      window.location.href = '/api/export.csv' + qs();
+    }
+
     function fmt(n) { return n == null ? '—' : n.toLocaleString(); }
     function fmtCost(n) { return n == null ? '—' : '$' + n.toFixed(2); }
     function fmtTokens(n) {
@@ -809,6 +840,10 @@
 
     // Wire up panel interactions once on load
     document.addEventListener('DOMContentLoaded', () => {
+      // Filters apply immediately — no need to hit Apply (kept as explicit refresh)
+      ['filterFrom', 'filterTo', 'filterSource'].forEach(id =>
+        document.getElementById(id).addEventListener('change', () => refresh()));
+
       const wrap = document.getElementById('filterAudience');
       const trigger = document.getElementById('filterAudienceTrigger');
       const panel = document.getElementById('filterAudiencePanel');
@@ -833,6 +868,7 @@
           else audience.users.delete(t.dataset.userEmail);
         }
         updateAudienceTriggerLabel();
+        refresh();
       });
 
       search.addEventListener('input', () => {
