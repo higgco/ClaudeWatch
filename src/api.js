@@ -33,26 +33,28 @@ router.get("/stats/summary", async (req, res) => {
   // clause for them — applying the source filter there throws "no such column".
   const wcNoSrc = whereClause(from, to, audience, null, "user_prompts");
 
-  const totalCost = scalar(db,
-    `SELECT COALESCE(SUM(cost_usd), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalRequests = scalar(db,
-    `SELECT COUNT(*) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalTokensIn = scalar(db,
-    `SELECT COALESCE(SUM(input_tokens), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalTokensOut = scalar(db,
-    `SELECT COALESCE(SUM(output_tokens), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
+  // One pass over api_requests instead of six separate range scans
+  const agg = query(db,
+    `SELECT COALESCE(SUM(cost_usd), 0) AS totalCost,
+            COUNT(*) AS totalRequests,
+            COALESCE(SUM(input_tokens), 0) AS totalTokensIn,
+            COALESCE(SUM(output_tokens), 0) AS totalTokensOut,
+            COUNT(DISTINCT user_email) AS uniqueUsers,
+            COUNT(DISTINCT session_id) AS uniqueSessions
+     FROM api_requests ${wc.sql}`, wc.params)[0] || {};
   const totalPrompts = scalar(db,
     `SELECT COUNT(*) AS v FROM user_prompts ${wcNoSrc.sql}`, wcNoSrc.params);
   const totalErrors = scalar(db,
     `SELECT COUNT(*) AS v FROM api_errors ${wcNoSrc.sql}`, wcNoSrc.params);
-  const uniqueUsers = scalar(db,
-    `SELECT COUNT(DISTINCT user_email) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const uniqueSessions = scalar(db,
-    `SELECT COUNT(DISTINCT session_id) AS v FROM api_requests ${wc.sql}`, wc.params);
 
   res.json({
-    totalCost, totalRequests, totalTokensIn, totalTokensOut,
-    totalPrompts, totalErrors, uniqueUsers, uniqueSessions,
+    totalCost: agg.totalCost || 0,
+    totalRequests: agg.totalRequests || 0,
+    totalTokensIn: agg.totalTokensIn || 0,
+    totalTokensOut: agg.totalTokensOut || 0,
+    totalPrompts, totalErrors,
+    uniqueUsers: agg.uniqueUsers || 0,
+    uniqueSessions: agg.uniqueSessions || 0,
   });
 });
 
