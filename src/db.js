@@ -2,7 +2,7 @@ const Database = require("better-sqlite3");
 const fs = require("fs");
 const path = require("path");
 
-const DB_PATH = path.join(__dirname, "..", "data", "usage.db");
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "usage.db");
 
 let db = null;
 
@@ -311,11 +311,21 @@ function migrate(db) {
   }
 
   // Indexes for common query patterns
-  db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_ts ON api_requests(timestamp)`);
+  // Covering index for the dashboard's time-range aggregates (summary,
+  // cost-over-time, by-user, by-model, hourly, sessions, windows). Every
+  // column those queries touch is in the index, so they never read table
+  // pages — which matters because api_requests rows carry response_content
+  // blobs that make table scans I/O-heavy on large databases.
+  db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_ts_cover ON api_requests(
+    timestamp, user_email, session_id, model, source,
+    cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)`);
+  // Superseded by idx_api_req_ts_cover (same leading column)
+  db.run(`DROP INDEX IF EXISTS idx_api_req_ts`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_user ON api_requests(user_email)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_model ON api_requests(model)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tool_uses_ts ON tool_uses(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_prompts_ts ON user_prompts(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_api_errors_ts ON api_errors(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_user_ts ON api_requests(user_email, timestamp)`);
   db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_req_aws_rid ON api_requests(aws_request_id) WHERE aws_request_id IS NOT NULL`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_source ON api_requests(source)`);
