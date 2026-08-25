@@ -33,26 +33,28 @@ router.get("/stats/summary", async (req, res) => {
   // clause for them — applying the source filter there throws "no such column".
   const wcNoSrc = whereClause(from, to, audience, null, "user_prompts");
 
-  const totalCost = scalar(db,
-    `SELECT COALESCE(SUM(cost_usd), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalRequests = scalar(db,
-    `SELECT COUNT(*) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalTokensIn = scalar(db,
-    `SELECT COALESCE(SUM(input_tokens), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const totalTokensOut = scalar(db,
-    `SELECT COALESCE(SUM(output_tokens), 0) AS v FROM api_requests ${wc.sql}`, wc.params);
+  // One pass over api_requests instead of six separate range scans
+  const agg = query(db,
+    `SELECT COALESCE(SUM(cost_usd), 0) AS totalCost,
+            COUNT(*) AS totalRequests,
+            COALESCE(SUM(input_tokens), 0) AS totalTokensIn,
+            COALESCE(SUM(output_tokens), 0) AS totalTokensOut,
+            COUNT(DISTINCT user_email) AS uniqueUsers,
+            COUNT(DISTINCT session_id) AS uniqueSessions
+     FROM api_requests ${wc.sql}`, wc.params)[0] || {};
   const totalPrompts = scalar(db,
     `SELECT COUNT(*) AS v FROM user_prompts ${wcNoSrc.sql}`, wcNoSrc.params);
   const totalErrors = scalar(db,
     `SELECT COUNT(*) AS v FROM api_errors ${wcNoSrc.sql}`, wcNoSrc.params);
-  const uniqueUsers = scalar(db,
-    `SELECT COUNT(DISTINCT user_email) AS v FROM api_requests ${wc.sql}`, wc.params);
-  const uniqueSessions = scalar(db,
-    `SELECT COUNT(DISTINCT session_id) AS v FROM api_requests ${wc.sql}`, wc.params);
 
   res.json({
-    totalCost, totalRequests, totalTokensIn, totalTokensOut,
-    totalPrompts, totalErrors, uniqueUsers, uniqueSessions,
+    totalCost: agg.totalCost || 0,
+    totalRequests: agg.totalRequests || 0,
+    totalTokensIn: agg.totalTokensIn || 0,
+    totalTokensOut: agg.totalTokensOut || 0,
+    totalPrompts, totalErrors,
+    uniqueUsers: agg.uniqueUsers || 0,
+    uniqueSessions: agg.uniqueSessions || 0,
   });
 });
 
@@ -223,6 +225,41 @@ router.get("/events/recent", async (req, res) => {
     [...userParams, ...userParams, ...userParams, ...userParams, limit]);
   await maskRows(rows);
   res.json(rows);
+});
+
+// ── CSV export of filtered api_requests ─────────────────────────────────────
+router.get("/export.csv", async (req, res) => {
+  const db = await getDb();
+  const { from, to, source } = req.query;
+  const audience = await parseAudience(db, req);
+  const wc = whereClause(from, to, audience, source);
+
+  const rows = query(db,
+    `SELECT timestamp, user_email, session_id, prompt_id, model, source,
+            cost_usd, input_tokens, output_tokens, cache_read_tokens,
+            cache_creation_tokens, duration_ms
+     FROM api_requests ${wc.sql}
+     ORDER BY timestamp`, wc.params);
+  await maskRows(rows);
+
+  const cols = [
+    "timestamp", "user_email", "session_id", "prompt_id", "model", "source",
+    "cost_usd", "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_creation_tokens", "duration_ms",
+  ];
+  const esc = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = [cols.join(",")]
+    .concat(rows.map(r => cols.map(c => esc(r[c])).join(",")))
+    .join("\r\n");
+
+  const range = `${(from || "start").slice(0, 10)}_${(to || "now").slice(0, 10)}`;
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="claude-usage_${range}.csv"`);
+  res.send(csv);
 });
 
 // ── Sessions list ───────────────────────────────────────────────────────────
