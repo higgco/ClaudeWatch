@@ -170,6 +170,7 @@ All `/api/stats/*` endpoints accept optional query params: `from`, `to`, `user`.
 | `GET /api/stats/hourly-activity` | Hour×day-of-week activity matrix |
 | `GET /api/events/recent` | Recent event feed (limit param) |
 | `GET /api/users` | List of known user emails |
+| `GET /api/version` | Build identity (`version`, `revision`, `dirty`, `builtAt`) |
 
 ## Dashboard Features
 
@@ -181,6 +182,39 @@ All `/api/stats/*` endpoints accept optional query params: `from`, `to`, `user`.
 - **User table**: per-user cost and token breakdown
 - **Event feed**: chronological stream of recent events
 - **Filters**: date range and user email, applied globally
+
+## Releasing
+
+Releases are tagged on `main` only. Anyone can deploy any commit — the version a running
+instance reports is derived automatically from its git checkout, so there is nothing for
+deployers to configure.
+
+To cut a release:
+
+```bash
+git checkout main && git pull
+git tag -a v1.2.3 -m "<what shipped>"
+git push origin v1.2.3
+gh release create v1.2.3 --generate-notes   # optional: publish a GitHub Release
+```
+
+Bump the third digit for fixes, the second for features, the first for breaking changes.
+
+### How the version is reported
+
+At startup (`npm start` / `npm run dev` run the `prestart` hook automatically) the server
+stamps `build-info.json` from `git describe --tags --always --dirty`. That value then appears
+in three places — the server boot banner, the dashboard footer, and `GET /api/version`:
+
+| `git describe` output | Meaning |
+|-----------------------|---------|
+| `v1.2.3` | A clean checkout of a tagged release. |
+| `v1.2.3-3-g62febad` | 3 commits past `v1.2.3`, at commit `62febad` (deploy is newer than the last tag). |
+| `v1.2.3-3-g62febad-dirty` | Same, plus uncommitted local edits — an untagged working tree. |
+
+`git describe` needs at least one tag to resolve; before the first release it falls back to a
+bare short SHA (`62febad` / `62febad-dirty`). In a non-git environment the stamp degrades to
+`unknown` rather than failing the boot.
 
 ## Configuration
 

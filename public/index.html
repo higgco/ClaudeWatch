@@ -160,6 +160,13 @@
 
     main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 
+    #versionInfo {
+      margin-top: 20px;
+      font-size: 12px;
+      color: var(--text-dim);
+      text-align: right;
+    }
+
     .ingest-dot {
       display: none;
       width: 9px;
@@ -739,6 +746,7 @@
         <div class="conversation-body" id="conversationBody"></div>
       </div>
     </div>
+    <div id="versionInfo"></div>
   </main>
 
   <script>
@@ -1551,6 +1559,13 @@
         el.title = 'NO INGEST TOKEN, SUBMISSION IS PUBLIC';
       }
       el.style.display = 'inline-block';
+    }).catch(() => {});
+
+    // Deployed version footer
+    fetch('/api/version').then(r => r.json()).then(d => {
+      const el = document.getElementById('versionInfo');
+      if (!el) return;
+      el.textContent = 'v' + d.version + ' · ' + d.revision + (d.dirty ? ' (dirty)' : '');
     }).catch(() => {});
 
     async function logout() {

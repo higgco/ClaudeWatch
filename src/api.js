@@ -20,6 +20,7 @@ const {
   startBedrockPoller,
 } = require("./bedrock");
 const { maskRows, unmaskFilter, aliasFor, isObscureMode } = require("./user-mask");
+const { getBuildInfo } = require("./version");
 
 const router = express.Router();
 
@@ -819,6 +820,10 @@ router.get("/admin/per-user-cost", async (req, res) => {
 router.get("/ingest-token", (req, res) => {
   const value = process.env.INGEST_TOKEN || null;
   res.json({ set: !!value, value });
+});
+
+router.get("/version", (req, res) => {
+  res.json(getBuildInfo());
 });
 
 // ── Dashboard user management ───────────────────────────────────────────────

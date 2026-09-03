@@ -5,7 +5,9 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "build-info": "node scripts/write-build-info.js",
+    "prestart": "node scripts/write-build-info.js"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.1019.0",

@@ -16,6 +16,7 @@ const {
 } = require("./auth");
 const { startBedrockPoller } = require("./bedrock");
 const { isObscureMode, ensureAliasesForAllUsers } = require("./user-mask");
+const { getBuildInfo } = require("./version");
 
 const app = express();
 const PORT = process.env.PORT || 3456;
@@ -128,9 +129,14 @@ async function maybeSeedDemo() {
     const auth = isAuthEnabled() ? "enabled" : "disabled (AUTH_DISABLED=1)";
     const ingestAuthState = INGEST_TOKEN ? "token required" : "open (no token)";
     const obscure = isObscureMode() ? "enabled (OBSCURE_USERS=1)" : "disabled";
+    const { version, revision, builtAt } = getBuildInfo();
+    const versionLine = builtAt
+      ? `${version} (${revision}, built ${builtAt.slice(0, 10)})`
+      : `${version} (${revision})`;
     console.log(`
 ┌──────────────────────────────────────────────────┐
 │  ClaudeWatch                                     │
+│  Version:    ${versionLine.padEnd(34)}│
 │  Dashboard:  http://localhost:${PORT}               │
 │  OTLP recv:  http://localhost:${PORT}/v1/{logs,traces}│
 │  Auth:       ${auth.padEnd(35)}│
