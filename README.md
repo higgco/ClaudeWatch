@@ -79,6 +79,22 @@ Or in managed settings:
 
 The server compares tokens in constant time and returns 401 on mismatch. Leaving `INGEST_TOKEN` unset preserves the open-ingest behavior.
 
+### LiteLLM gateway
+
+The receiver also accepts LiteLLM OTLP/HTTP protobuf or JSON request spans at `/v1/traces`.
+Configure the proxy with `callbacks: ["otel"]`,
+`USE_OTEL_LITELLM_REQUEST_SPAN=true`, and an OTLP endpoint that can reach this
+server. In Docker Desktop, use `http://host.docker.internal:3456`. One
+`litellm_request` span becomes one dashboard API-request row, including model,
+tokens, cost, duration, and LiteLLM virtual-key identity metadata.
+
+Use one LiteLLM virtual key per person and bind each key to a user whose
+`user_id` is their email address. ClaudeWatch records gateway rows as
+`source=litellm_gateway`, so they can be separated from direct Claude Code
+telemetry. When LiteLLM content capture is `SPAN_ONLY`, ClaudeWatch also stores
+the standard `gen_ai.input.messages` and `gen_ai.output.messages` text for its
+session conversation view.
+
 ## Connecting OpenCode
 
 [OpenCode](https://opencode.ai) can report usage to the same `/v1/logs` receiver via the community [`@devtheops/opencode-plugin-otel`](https://github.com/DEVtheOPS/opencode-plugin-otel) plugin, which emits per-request **cost, tokens, and model** as OTLP events. (OpenCode's built-in `experimental.openTelemetry` only emits operational logs with no usage data — this plugin is what provides the cost/token signal.)
@@ -111,11 +127,13 @@ OpenCode events arrive with the resource attribute `service.name=opencode`; the 
 ## Architecture
 
 ```
-Claude Code instances
-  │  (OTLP HTTP/JSON)
+Claude Code instances                 LiteLLM gateway
+  │  (OTLP HTTP/JSON logs)              │  (OTLP HTTP/Protobuf traces)
+  └──────────────────┬───────────────────┘
   ▼
 ┌─────────────────────┐
-│  POST /v1/logs      │  ← OTLP receiver
+│  POST /v1/logs      │  ← Claude Code/OpenCode events
+│  POST /v1/traces    │  ← LiteLLM usage spans
 │  Express server     │
 │  ┌───────────────┐  │
 │  │  SQLite (data/ │  │  ← Persistent storage
@@ -173,7 +191,7 @@ All configuration is via environment variables. None are required — the server
 | `PORT` | `3456` | Server listen port (used for both the dashboard and the OTLP receiver). |
 | `SEED_DEMO` | `0` | Set to `1` to populate ~30 days of demo data on first run. No-op if `api_requests` already has rows. |
 | `AUTH_DISABLED` | `0` | Set to `1` to disable dashboard login entirely. Independent from `INGEST_TOKEN` — this flag only controls the dashboard, not the OTLP receiver. |
-| `INGEST_TOKEN` | _(unset)_ | If set, the OTLP receiver at `/v1/logs` requires `Authorization: Bearer <token>` on every request. Clients send it via OpenTelemetry's `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <token>"`. Leave unset for open ingest (backward compatible). |
+| `INGEST_TOKEN` | _(unset)_ | If set, the OTLP receivers at `/v1/logs` and `/v1/traces` require `Authorization: Bearer <token>` on every request. Clients send it via OpenTelemetry's `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <token>"`. Leave unset for open ingest (backward compatible). |
 | `SESSION_SECRET` | random | HMAC key used to sign session cookies. If unset, a random 32-byte secret is generated at startup, which invalidates all existing sessions on every restart — set this to a stable value in production. |
 | `AUTH_USER` | `admin` | Username for the **initial** admin account. Only read on first run when no `dashboard_users` rows exist; ignored on subsequent boots. Manage users from the admin UI after that. |
 | `AUTH_PASS` | random | Password for the **initial** admin account. Only read on first run. If unset, a random password is generated and printed to stdout — capture it from the logs or set this explicitly. |

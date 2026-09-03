@@ -29,9 +29,8 @@ router.get("/stats/summary", async (req, res) => {
   const { from, to, source } = req.query;
   const audience = await parseAudience(db, req);
   const wc = whereClause(from, to, audience, source);
-  // user_prompts / api_errors have no `source` column, so reuse a source-less
-  // clause for them — applying the source filter there throws "no such column".
-  const wcNoSrc = whereClause(from, to, audience, null, "user_prompts");
+  const wcPrompts = whereClause(from, to, audience, source, "user_prompts");
+  const wcErrors = whereClause(from, to, audience, source, "api_errors");
 
   // One pass over api_requests instead of six separate range scans
   const agg = query(db,
@@ -43,9 +42,9 @@ router.get("/stats/summary", async (req, res) => {
             COUNT(DISTINCT session_id) AS uniqueSessions
      FROM api_requests ${wc.sql}`, wc.params)[0] || {};
   const totalPrompts = scalar(db,
-    `SELECT COUNT(*) AS v FROM user_prompts ${wcNoSrc.sql}`, wcNoSrc.params);
+    `SELECT COUNT(*) AS v FROM user_prompts ${wcPrompts.sql}`, wcPrompts.params);
   const totalErrors = scalar(db,
-    `SELECT COUNT(*) AS v FROM api_errors ${wcNoSrc.sql}`, wcNoSrc.params);
+    `SELECT COUNT(*) AS v FROM api_errors ${wcErrors.sql}`, wcErrors.params);
 
   res.json({
     totalCost: agg.totalCost || 0,
@@ -155,9 +154,9 @@ router.get("/stats/by-user", async (req, res) => {
 // ── Tool usage breakdown ────────────────────────────────────────────────────
 router.get("/stats/tools", async (req, res) => {
   const db = await getDb();
-  const { from, to } = req.query;
+  const { from, to, source } = req.query;
   const audience = await parseAudience(db, req);
-  const wc = whereClause(from, to, audience, null, "tool_uses");
+  const wc = whereClause(from, to, audience, source, "tool_uses");
   const rows = query(db,
     `SELECT tool_name,
             COUNT(*) AS uses,
@@ -193,36 +192,37 @@ router.get("/events/recent", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   const audience = await parseAudience(db, req);
 
-  let userWhere = "";
-  let userParams = [];
-  if (Array.isArray(audience)) {
-    if (audience.length === 0) {
-      userWhere = "WHERE 1=0";
-    } else {
-      userWhere = `WHERE user_email IN (${audience.map(() => "?").join(",")})`;
-      userParams = audience;
-    }
-  }
+  const { source } = req.query;
+  const apiWhere = whereClause(null, null, audience, source, "api_requests");
+  const toolWhere = whereClause(null, null, audience, source, "tool_uses");
+  const promptWhere = whereClause(null, null, audience, source, "user_prompts");
+  const errorWhere = whereClause(null, null, audience, source, "api_errors");
 
   const rows = query(db,
     `SELECT 'api_request' AS type, timestamp, user_email, model, cost_usd, session_id,
             input_tokens, output_tokens, source
-     FROM api_requests ${userWhere}
+     FROM api_requests ${apiWhere.sql}
      UNION ALL
      SELECT 'tool_use', timestamp, user_email, tool_name, duration_ms, session_id,
-            NULL, NULL, NULL
-     FROM tool_uses ${userWhere}
+            NULL, NULL, 'claude_code'
+     FROM tool_uses ${toolWhere.sql}
      UNION ALL
      SELECT 'prompt', timestamp, user_email, NULL, prompt_length, session_id,
-            NULL, NULL, NULL
-     FROM user_prompts ${userWhere}
+            NULL, NULL, COALESCE(source, 'claude_code')
+     FROM user_prompts ${promptWhere.sql}
      UNION ALL
      SELECT 'error', timestamp, user_email, error_message, status_code, session_id,
-            NULL, NULL, NULL
-     FROM api_errors ${userWhere}
+            NULL, NULL, 'claude_code'
+     FROM api_errors ${errorWhere.sql}
      ORDER BY timestamp DESC
      LIMIT ?`,
-    [...userParams, ...userParams, ...userParams, ...userParams, limit]);
+    [
+      ...apiWhere.params,
+      ...toolWhere.params,
+      ...promptWhere.params,
+      ...errorWhere.params,
+      limit,
+    ]);
   await maskRows(rows);
   res.json(rows);
 });
@@ -1019,8 +1019,8 @@ router.delete("/teams/:id/members/:email", async (req, res) => {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 // `audience` is either null (no user filter) or an array of emails.
 // Empty array means "filter to nobody" → emit 1=0 so the result is empty.
-// `source` filters api_requests.source ("anthropic"/"bedrock"/"claude_code"),
-// only when querying the api_requests table.
+// `source` filters tables that carry an explicit source column. Tables that
+// only contain Claude Code client events are excluded for non-client sources.
 function whereClause(from, to, audience, source, table = "api_requests") {
   const conds = [];
   const params = [];
@@ -1036,11 +1036,15 @@ function whereClause(from, to, audience, source, table = "api_requests") {
     }
   }
 
-  if (source && source !== "all" && table === "api_requests") {
-    if (source === "claude_code") {
-      conds.push("(source = 'claude_code' OR source IS NULL)");
-    } else {
-      conds.push("source = ?"); params.push(source);
+  if (source && source !== "all") {
+    if (table === "api_requests" || table === "user_prompts") {
+      if (source === "claude_code") {
+        conds.push("(source = 'claude_code' OR source IS NULL)");
+      } else {
+        conds.push("source = ?"); params.push(source);
+      }
+    } else if (source !== "claude_code") {
+      conds.push("1=0");
     }
   }
 

@@ -1,7 +1,8 @@
 const express = require("express");
 const path = require("path");
 const crypto = require("crypto");
-const { ingestOtlpLogs } = require("./otlp");
+const { ingestOtlpLogs, ingestOtlpTraces } = require("./otlp");
+const { decodeOtlpTraces } = require("./otlp-protobuf");
 const apiRouter = require("./api");
 const { getDb } = require("./db");
 const {
@@ -19,6 +20,10 @@ const { isObscureMode, ensureAliasesForAllUsers } = require("./user-mask");
 const app = express();
 const PORT = process.env.PORT || 3456;
 const INGEST_TOKEN = process.env.INGEST_TOKEN || null;
+const protobufBody = express.raw({
+  type: ["application/x-protobuf", "application/protobuf"],
+  limit: "10mb",
+});
 
 // ── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
@@ -52,7 +57,7 @@ function ingestAuth(req, res, next) {
   next();
 }
 
-const ingestHandler = async (req, res) => {
+const ingestLogsHandler = async (req, res) => {
   try {
     const count = await ingestOtlpLogs(req.body);
     console.log(`[otlp] ingested ${count} event(s)`);
@@ -64,9 +69,29 @@ const ingestHandler = async (req, res) => {
   }
 };
 
-app.post("/v1/logs", ingestAuth, ingestHandler);
+const ingestTracesHandler = async (req, res) => {
+  try {
+    let payload = req.body;
+    if (Buffer.isBuffer(payload)) {
+      // express.raw inflates gzip/deflate/br request bodies by default.
+      payload = decodeOtlpTraces(payload);
+    }
+    const count = await ingestOtlpTraces(payload || {});
+    if (count > 0 || process.env.OTLP_DEBUG) {
+      console.log(`[otlp] ingested ${count} LiteLLM request span(s)`);
+    }
+    res.status(200).json({});
+  } catch (err) {
+    console.error("[otlp] trace ingest error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+app.post("/v1/logs", ingestAuth, ingestLogsHandler);
 // Also accept the protobuf-style route that some exporters use
-app.post("/v1/logs/", ingestAuth, ingestHandler);
+app.post("/v1/logs/", ingestAuth, ingestLogsHandler);
+app.post("/v1/traces", ingestAuth, protobufBody, ingestTracesHandler);
+app.post("/v1/traces/", ingestAuth, protobufBody, ingestTracesHandler);
 
 // ── Auth middleware (everything below requires login) ────────────────────────
 app.use(authMiddleware);
@@ -107,7 +132,7 @@ async function maybeSeedDemo() {
 ┌──────────────────────────────────────────────────┐
 │  ClaudeWatch                                     │
 │  Dashboard:  http://localhost:${PORT}               │
-│  OTLP recv:  http://localhost:${PORT}/v1/logs       │
+│  OTLP recv:  http://localhost:${PORT}/v1/{logs,traces}│
 │  Auth:       ${auth.padEnd(35)}│
 │  Ingest:     ${ingestAuthState.padEnd(35)}│
 │  Obscure:    ${obscure.padEnd(35)}│
