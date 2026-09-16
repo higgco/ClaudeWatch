@@ -20,6 +20,7 @@ const {
   startBedrockPoller,
 } = require("./bedrock");
 const { maskRows, unmaskFilter, aliasFor, isObscureMode } = require("./user-mask");
+const { getBuildInfo } = require("./version");
 
 const router = express.Router();
 
@@ -29,9 +30,8 @@ router.get("/stats/summary", async (req, res) => {
   const { from, to, source } = req.query;
   const audience = await parseAudience(db, req);
   const wc = whereClause(from, to, audience, source);
-  // user_prompts / api_errors have no `source` column, so reuse a source-less
-  // clause for them — applying the source filter there throws "no such column".
-  const wcNoSrc = whereClause(from, to, audience, null, "user_prompts");
+  const wcPrompts = whereClause(from, to, audience, source, "user_prompts");
+  const wcErrors = whereClause(from, to, audience, source, "api_errors");
 
   // One pass over api_requests instead of six separate range scans
   const agg = query(db,
@@ -43,9 +43,9 @@ router.get("/stats/summary", async (req, res) => {
             COUNT(DISTINCT session_id) AS uniqueSessions
      FROM api_requests ${wc.sql}`, wc.params)[0] || {};
   const totalPrompts = scalar(db,
-    `SELECT COUNT(*) AS v FROM user_prompts ${wcNoSrc.sql}`, wcNoSrc.params);
+    `SELECT COUNT(*) AS v FROM user_prompts ${wcPrompts.sql}`, wcPrompts.params);
   const totalErrors = scalar(db,
-    `SELECT COUNT(*) AS v FROM api_errors ${wcNoSrc.sql}`, wcNoSrc.params);
+    `SELECT COUNT(*) AS v FROM api_errors ${wcErrors.sql}`, wcErrors.params);
 
   res.json({
     totalCost: agg.totalCost || 0,
@@ -155,9 +155,9 @@ router.get("/stats/by-user", async (req, res) => {
 // ── Tool usage breakdown ────────────────────────────────────────────────────
 router.get("/stats/tools", async (req, res) => {
   const db = await getDb();
-  const { from, to } = req.query;
+  const { from, to, source } = req.query;
   const audience = await parseAudience(db, req);
-  const wc = whereClause(from, to, audience, null, "tool_uses");
+  const wc = whereClause(from, to, audience, source, "tool_uses");
   const rows = query(db,
     `SELECT tool_name,
             COUNT(*) AS uses,
@@ -193,36 +193,37 @@ router.get("/events/recent", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   const audience = await parseAudience(db, req);
 
-  let userWhere = "";
-  let userParams = [];
-  if (Array.isArray(audience)) {
-    if (audience.length === 0) {
-      userWhere = "WHERE 1=0";
-    } else {
-      userWhere = `WHERE user_email IN (${audience.map(() => "?").join(",")})`;
-      userParams = audience;
-    }
-  }
+  const { source } = req.query;
+  const apiWhere = whereClause(null, null, audience, source, "api_requests");
+  const toolWhere = whereClause(null, null, audience, source, "tool_uses");
+  const promptWhere = whereClause(null, null, audience, source, "user_prompts");
+  const errorWhere = whereClause(null, null, audience, source, "api_errors");
 
   const rows = query(db,
     `SELECT 'api_request' AS type, timestamp, user_email, model, cost_usd, session_id,
             input_tokens, output_tokens, source
-     FROM api_requests ${userWhere}
+     FROM api_requests ${apiWhere.sql}
      UNION ALL
      SELECT 'tool_use', timestamp, user_email, tool_name, duration_ms, session_id,
-            NULL, NULL, NULL
-     FROM tool_uses ${userWhere}
+            NULL, NULL, 'claude_code'
+     FROM tool_uses ${toolWhere.sql}
      UNION ALL
      SELECT 'prompt', timestamp, user_email, NULL, prompt_length, session_id,
-            NULL, NULL, NULL
-     FROM user_prompts ${userWhere}
+            NULL, NULL, COALESCE(source, 'claude_code')
+     FROM user_prompts ${promptWhere.sql}
      UNION ALL
      SELECT 'error', timestamp, user_email, error_message, status_code, session_id,
-            NULL, NULL, NULL
-     FROM api_errors ${userWhere}
+            NULL, NULL, 'claude_code'
+     FROM api_errors ${errorWhere.sql}
      ORDER BY timestamp DESC
      LIMIT ?`,
-    [...userParams, ...userParams, ...userParams, ...userParams, limit]);
+    [
+      ...apiWhere.params,
+      ...toolWhere.params,
+      ...promptWhere.params,
+      ...errorWhere.params,
+      limit,
+    ]);
   await maskRows(rows);
   res.json(rows);
 });
@@ -749,6 +750,331 @@ router.get("/stats/weekly-windows", async (req, res) => {
   res.json({ summary: computeWindowSummary(perUser), per_user: perUser });
 });
 
+// ── Consolidated dashboard payload ──────────────────────────────────────────
+// Returns every section the dashboard tiles/tables/charts need in one round
+// trip. Resolves the filter (audience + source + date range) ONCE, then runs
+// the grouped aggregate scans and the two window passes with that shared
+// context — instead of the frontend firing 14 endpoints that each re-resolve
+// the filter and re-scan api_requests.
+router.get("/dashboard", async (req, res) => {
+  const db = await getDb();
+  const { from, to, source } = req.query;
+  const audience = await parseAudience(db, req);
+  const wc = whereClause(from, to, audience, source);
+
+  // ── summary ─────────────────────────────────────────────────────────────
+  const wcPrompts = whereClause(from, to, audience, source, "user_prompts");
+  const wcErrors = whereClause(from, to, audience, source, "api_errors");
+  const agg = query(db,
+    `SELECT COALESCE(SUM(cost_usd), 0) AS totalCost,
+            COUNT(*) AS totalRequests,
+            COALESCE(SUM(input_tokens), 0) AS totalTokensIn,
+            COALESCE(SUM(output_tokens), 0) AS totalTokensOut,
+            COUNT(DISTINCT user_email) AS uniqueUsers,
+            COUNT(DISTINCT session_id) AS uniqueSessions
+     FROM api_requests ${wc.sql}`, wc.params)[0] || {};
+  const totalPrompts = scalar(db,
+    `SELECT COUNT(*) AS v FROM user_prompts ${wcPrompts.sql}`, wcPrompts.params);
+  const totalErrors = scalar(db,
+    `SELECT COUNT(*) AS v FROM api_errors ${wcErrors.sql}`, wcErrors.params);
+
+  const summary = {
+    totalCost: agg.totalCost || 0,
+    totalRequests: agg.totalRequests || 0,
+    totalTokensIn: agg.totalTokensIn || 0,
+    totalTokensOut: agg.totalTokensOut || 0,
+    totalPrompts, totalErrors,
+    uniqueUsers: agg.uniqueUsers || 0,
+    uniqueSessions: agg.uniqueSessions || 0,
+  };
+
+  // ── costTime ────────────────────────────────────────────────────────────
+  const costTime = query(db,
+    `SELECT DATE(timestamp) AS day,
+            SUM(cost_usd) AS cost,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            COUNT(*) AS requests
+     FROM api_requests ${wc.sql}
+     GROUP BY DATE(timestamp)
+     ORDER BY day`, wc.params);
+
+  // ── byModel ─────────────────────────────────────────────────────────────
+  const byModel = query(db,
+    `SELECT model,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cache_read_tokens) AS cache_read_tokens,
+            SUM(cache_creation_tokens) AS cache_creation_tokens
+     FROM api_requests ${wc.sql}
+     GROUP BY model
+     ORDER BY cost DESC`, wc.params);
+
+  // ── byUser (incl. per-model breakdown + top model) ─────────────────────
+  const byUser = query(db,
+    `SELECT user_email,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cache_read_tokens) AS cache_read_tokens,
+            SUM(cache_creation_tokens) AS cache_creation_tokens,
+            COUNT(DISTINCT session_id) AS sessions
+     FROM api_requests ${wc.sql}
+     GROUP BY user_email
+     ORDER BY cost DESC`, wc.params);
+  const modelRows = query(db,
+    `SELECT user_email, model,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost,
+            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)) AS total_tokens
+     FROM api_requests ${wc.sql}
+     GROUP BY user_email, model
+     ORDER BY user_email, total_tokens DESC`, wc.params);
+  const topModelByUser = {};
+  const modelsByUser = {};
+  for (const r of modelRows) {
+    if (!topModelByUser[r.user_email]) topModelByUser[r.user_email] = { model: r.model, tokens: r.total_tokens };
+    if (!modelsByUser[r.user_email]) modelsByUser[r.user_email] = [];
+    modelsByUser[r.user_email].push({ model: r.model, requests: r.requests, cost: r.cost, total_tokens: r.total_tokens });
+  }
+  for (const r of byUser) {
+    const tm = topModelByUser[r.user_email];
+    r.top_model = tm?.model || null;
+    r.top_model_tokens = tm?.tokens || 0;
+    r.models = modelsByUser[r.user_email] || [];
+  }
+  await maskRows(byUser);
+
+  // ── tools ──────────────────────────────────────────────────────────────
+  const toolWc = whereClause(from, to, audience, source, "tool_uses");
+  const tools = query(db,
+    `SELECT tool_name,
+            COUNT(*) AS uses,
+            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
+            SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures,
+            AVG(duration_ms) AS avg_duration_ms
+     FROM tool_uses ${toolWc.sql}
+     GROUP BY tool_name
+     ORDER BY uses DESC`, toolWc.params);
+
+  // ── hourly ──────────────────────────────────────────────────────────────
+  const hourly = query(db,
+    `SELECT CAST(strftime('%w', timestamp) AS INTEGER) AS dow,
+            CAST(strftime('%H', timestamp) AS INTEGER) AS hour,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost
+     FROM api_requests ${wc.sql}
+     GROUP BY dow, hour
+     ORDER BY dow, hour`, wc.params);
+
+  // ── sessions ────────────────────────────────────────────────────────────
+  const sessions = query(db,
+    `SELECT session_id,
+            user_email,
+            MIN(timestamp) AS started,
+            MAX(timestamp) AS ended,
+            COUNT(*) AS requests,
+            SUM(cost_usd) AS cost,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            GROUP_CONCAT(DISTINCT model) AS models
+     FROM api_requests ${wc.sql}
+     GROUP BY session_id
+     ORDER BY started DESC
+     LIMIT 100`, wc.params);
+  await maskRows(sessions);
+
+  // ── events ──────────────────────────────────────────────────────────────
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const apiWhere = whereClause(null, null, audience, source, "api_requests");
+  const toolWhere2 = whereClause(null, null, audience, source, "tool_uses");
+  const promptWhere = whereClause(null, null, audience, source, "user_prompts");
+  const errorWhere = whereClause(null, null, audience, source, "api_errors");
+  const events = query(db,
+    `SELECT 'api_request' AS type, timestamp, user_email, model, cost_usd, session_id,
+            input_tokens, output_tokens, source
+     FROM api_requests ${apiWhere.sql}
+     UNION ALL
+     SELECT 'tool_use', timestamp, user_email, tool_name, duration_ms, session_id,
+            NULL, NULL, 'claude_code'
+     FROM tool_uses ${toolWhere2.sql}
+     UNION ALL
+     SELECT 'prompt', timestamp, user_email, NULL, prompt_length, session_id,
+            NULL, NULL, COALESCE(source, 'claude_code')
+     FROM user_prompts ${promptWhere.sql}
+     UNION ALL
+     SELECT 'error', timestamp, user_email, error_message, status_code, session_id,
+            NULL, NULL, 'claude_code'
+     FROM api_errors ${errorWhere.sql}
+     ORDER BY timestamp DESC
+     LIMIT ?`,
+    [
+      ...apiWhere.params,
+      ...toolWhere2.params,
+      ...promptWhere.params,
+      ...errorWhere.params,
+      limit,
+    ]);
+  await maskRows(events);
+
+  // ── users ───────────────────────────────────────────────────────────────
+  const usersRaw = query(db,
+    `SELECT DISTINCT user_email FROM api_requests WHERE user_email IS NOT NULL ORDER BY user_email`);
+  await maskRows(usersRaw);
+  const users = usersRaw.map(r => r.user_email);
+  if (isObscureMode()) {
+    users.sort((a, b) => {
+      const na = parseInt((a || "").slice(5), 10);
+      const nb = parseInt((b || "").slice(5), 10);
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+      return String(a).localeCompare(String(b));
+    });
+  }
+
+  // ── teams ───────────────────────────────────────────────────────────────
+  const teamRows = query(db, `SELECT id, name, created_at FROM teams ORDER BY name`);
+  const teamMembers = query(db, `SELECT team_id, user_email FROM team_members ORDER BY user_email`);
+  await maskRows(teamMembers);
+  const byTeam = {};
+  for (const m of teamMembers) {
+    (byTeam[m.team_id] = byTeam[m.team_id] || []).push(m.user_email);
+  }
+  const teams = teamRows.map(t => ({ ...t, members: byTeam[t.id] || [] }));
+
+  // ── sessionWindows (5h) + weeklyWindows (7d) ────────────────────────────
+  const sessionWindowsPerUser = query(db, windowStatsSql(wc.sql, 18000), wc.params);
+  await maskRows(sessionWindowsPerUser);
+  const sessionWindows = { summary: computeWindowSummary(sessionWindowsPerUser), per_user: sessionWindowsPerUser };
+
+  const weeklyPerUser = query(db, windowStatsSql(wc.sql, 604800), wc.params);
+  await maskRows(weeklyPerUser);
+  const weeklyWindows = { summary: computeWindowSummary(weeklyPerUser), per_user: weeklyPerUser };
+
+  // ── billing ─────────────────────────────────────────────────────────────
+  const configRows = query(db, "SELECT * FROM plan_config LIMIT 1");
+  const config = configRows[0] || {
+    billing_cycle_day: 1,
+    standard_seat_cost_usd: 20,
+    premium_seat_cost_usd: 100,
+    commitment_amount_usd: null,
+    commitment_start_date: null,
+    commitment_end_date: null,
+    commitment_discount_pct: 0,
+  };
+  const period = getBillingPeriod(config.billing_cycle_day);
+  const discountFactor = 1 - (Number(config.commitment_discount_pct) || 0) / 100;
+  const billingByUser = query(db,
+    `SELECT ar.user_email,
+            COALESCE(m.name, ar.user_email) AS name,
+            COALESCE(m.seat_tier, 'Standard') AS seat_tier,
+            COALESCE(m.billing_model, 'seat') AS billing_model,
+            SUM(ar.cost_usd) AS api_equivalent_cost,
+            COUNT(*) AS requests,
+            SUM(COALESCE(ar.input_tokens,0) + COALESCE(ar.output_tokens,0)) AS tokens
+     FROM api_requests ar
+     LEFT JOIN org_members m ON LOWER(ar.user_email) = LOWER(m.email)
+     WHERE ar.timestamp >= ? AND ar.timestamp < ?
+     GROUP BY ar.user_email
+     ORDER BY api_equivalent_cost DESC`,
+    [period.start, period.end]);
+  let totalCost = 0, totalTokens = 0;
+  for (const u of billingByUser) {
+    totalCost += u.api_equivalent_cost || 0;
+    totalTokens += u.tokens || 0;
+    u.effective_cost = Math.round((u.api_equivalent_cost || 0) * discountFactor * 10000) / 10000;
+  }
+  let commitment = null;
+  if (config.commitment_amount_usd && config.commitment_amount_usd > 0) {
+    const start = config.commitment_start_date || period.start.slice(0, 10);
+    const end = config.commitment_end_date || period.end.slice(0, 10);
+    const startIso = start.length === 10 ? start + "T00:00:00.000Z" : start;
+    const endIso = end.length === 10 ? end + "T23:59:59.999Z" : end;
+    const poolRow = query(db,
+      `SELECT COALESCE(SUM(ar.cost_usd), 0) AS list_cost
+       FROM api_requests ar
+       LEFT JOIN org_members m ON LOWER(ar.user_email) = LOWER(m.email)
+       WHERE ar.timestamp >= ? AND ar.timestamp < ?
+         AND COALESCE(m.billing_model, 'seat') = 'enterprise'`,
+      [startIso, endIso])[0] || { list_cost: 0 };
+    const consumedEffective = (poolRow.list_cost || 0) * discountFactor;
+    const startDate = new Date(startIso);
+    const endDate = new Date(endIso);
+    const now = new Date();
+    const msPerDay = 86400000;
+    const totalDays = Math.max(1, Math.round((endDate - startDate) / msPerDay));
+    const daysElapsed = Math.max(0, Math.min(totalDays, Math.round((now - startDate) / msPerDay)));
+    const daysRemaining = Math.max(0, totalDays - daysElapsed);
+    const expectedSoFar = (config.commitment_amount_usd * daysElapsed) / totalDays;
+    commitment = {
+      amount_usd: config.commitment_amount_usd,
+      discount_pct: Number(config.commitment_discount_pct) || 0,
+      start: startIso,
+      end: endIso,
+      list_consumed: Math.round((poolRow.list_cost || 0) * 100) / 100,
+      consumed: Math.round(consumedEffective * 100) / 100,
+      remaining: Math.round((config.commitment_amount_usd - consumedEffective) * 100) / 100,
+      pct_consumed: config.commitment_amount_usd > 0
+        ? Math.round((consumedEffective / config.commitment_amount_usd) * 1000) / 10
+        : 0,
+      total_days: totalDays,
+      days_elapsed: daysElapsed,
+      days_remaining: daysRemaining,
+      expected_so_far: Math.round(expectedSoFar * 100) / 100,
+      pace_delta: Math.round((consumedEffective - expectedSoFar) * 100) / 100,
+    };
+  }
+  await maskRows(billingByUser, ["user_email", "name"]);
+  const billing = {
+    billing_period: period,
+    seat_costs: {
+      standard: config.standard_seat_cost_usd,
+      premium: config.premium_seat_cost_usd,
+      standard_included: config.standard_seat_included_usd ?? config.standard_seat_cost_usd,
+      premium_included: config.premium_seat_included_usd ?? config.premium_seat_cost_usd,
+      standard_overage_pct: config.standard_seat_overage_pct ?? 0,
+      premium_overage_pct: config.premium_seat_overage_pct ?? 0,
+    },
+    commitment,
+    total_api_equivalent_cost: Math.round(totalCost * 100) / 100,
+    total_tokens: totalTokens,
+    by_user: billingByUser,
+  };
+
+  // ── adminCost ───────────────────────────────────────────────────────────
+  let adminCost = { available: false };
+  const apiKey = await getAdminApiKey();
+  if (apiKey) {
+    try {
+      const byUserApi = await fetchClaudeCodeRange(
+        apiKey,
+        period.start.slice(0, 10),
+        period.end.slice(0, 10)
+      );
+      const adminUsers = Object.entries(byUserApi).map(([email, data]) => ({
+        email,
+        anthropic_cost: Math.round(data.estimated_cost_cents) / 100,
+        anthropic_tokens: data.tokens,
+        days_active: data.days_active,
+      }));
+      await maskRows(adminUsers, ["email"], "email");
+      adminCost = { available: true, billing_period: period, users: adminUsers };
+    } catch (err) {
+      console.error("[admin] per-user-cost error:", err.message);
+      adminCost = { available: false, error: err.message };
+    }
+  }
+
+  res.json({
+    summary, costTime, byModel, tools, hourly, byUser,
+    sessions, events, users, teams, sessionWindows, weeklyWindows,
+    billing, adminCost,
+  });
+});
+
 // ── Admin API proxies ───────────────────────────────────────────────────────
 router.get("/admin/cost-report", async (req, res) => {
   const apiKey = await getAdminApiKey();
@@ -819,6 +1145,10 @@ router.get("/admin/per-user-cost", async (req, res) => {
 router.get("/ingest-token", (req, res) => {
   const value = process.env.INGEST_TOKEN || null;
   res.json({ set: !!value, value });
+});
+
+router.get("/version", (req, res) => {
+  res.json(getBuildInfo());
 });
 
 // ── Dashboard user management ───────────────────────────────────────────────
@@ -1019,8 +1349,8 @@ router.delete("/teams/:id/members/:email", async (req, res) => {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 // `audience` is either null (no user filter) or an array of emails.
 // Empty array means "filter to nobody" → emit 1=0 so the result is empty.
-// `source` filters api_requests.source ("anthropic"/"bedrock"/"claude_code"),
-// only when querying the api_requests table.
+// `source` filters tables that carry an explicit source column. Tables that
+// only contain Claude Code client events are excluded for non-client sources.
 function whereClause(from, to, audience, source, table = "api_requests") {
   const conds = [];
   const params = [];
@@ -1036,11 +1366,15 @@ function whereClause(from, to, audience, source, table = "api_requests") {
     }
   }
 
-  if (source && source !== "all" && table === "api_requests") {
-    if (source === "claude_code") {
-      conds.push("(source = 'claude_code' OR source IS NULL)");
-    } else {
-      conds.push("source = ?"); params.push(source);
+  if (source && source !== "all") {
+    if (table === "api_requests" || table === "user_prompts") {
+      if (source === "claude_code") {
+        conds.push("(source = 'claude_code' OR source IS NULL)");
+      } else {
+        conds.push("source = ?"); params.push(source);
+      }
+    } else if (source !== "claude_code") {
+      conds.push("1=0");
     }
   }
 

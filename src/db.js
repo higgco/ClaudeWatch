@@ -160,9 +160,11 @@ function migrate(db) {
       user_id       TEXT,
       org_id        TEXT,
       prompt_length INTEGER,
-      prompt_content TEXT
+      prompt_content TEXT,
+      source         TEXT
     )
   `);
+  try { db.run(`ALTER TABLE user_prompts ADD COLUMN source TEXT`); } catch (_) {}
 
   db.run(`
     CREATE TABLE IF NOT EXISTS api_errors (
@@ -325,6 +327,7 @@ function migrate(db) {
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_model ON api_requests(model)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tool_uses_ts ON tool_uses(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_prompts_ts ON user_prompts(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prompts_source ON user_prompts(source)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_errors_ts ON api_errors(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_req_user_ts ON api_requests(user_email, timestamp)`);
   db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_req_aws_rid ON api_requests(aws_request_id) WHERE aws_request_id IS NOT NULL`);
