@@ -160,6 +160,13 @@
 
     main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 
+    #versionInfo {
+      margin-top: 20px;
+      font-size: 12px;
+      color: var(--text-dim);
+      text-align: right;
+    }
+
     .ingest-dot {
       display: none;
       width: 9px;
@@ -352,6 +359,42 @@
     /* ── Sessions & Conversation ──────────────────────────────────── */
     .session-row { cursor: pointer; }
     .session-row:hover td { background: var(--surface2); }
+
+    #loadingModal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 2000;
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(4px);
+      align-items: center;
+      justify-content: center;
+    }
+    #loadingModal.open { display: flex; }
+
+    .loading-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px 32px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    }
+
+    .loading-spinner {
+      width: 22px;
+      height: 22px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent2);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading-card span { font-size: 14px; color: var(--text); font-weight: 500; }
 
     #conversationModal {
       display: none;
@@ -583,6 +626,7 @@
       <select id="filterSource">
         <option value="all">All</option>
         <option value="claude_code">Claude Code</option>
+        <option value="litellm_gateway">LiteLLM Gateway</option>
         <option value="bedrock">Bedrock</option>
         <option value="opencode">OpenCode</option>
       </select>
@@ -683,6 +727,13 @@
         <tbody></tbody>
       </table>
     </div>
+    <div id="loadingModal" role="status" aria-live="polite" aria-label="Loading data">
+      <div class="loading-card">
+        <div class="loading-spinner"></div>
+        <span>Loading…</span>
+      </div>
+    </div>
+
     <div id="conversationModal">
       <div class="modal-content">
         <div class="modal-header">
@@ -695,6 +746,7 @@
         <div class="conversation-body" id="conversationBody"></div>
       </div>
     </div>
+    <div id="versionInfo"></div>
   </main>
 
   <script>
@@ -725,9 +777,29 @@
     }
 
     async function api(path) {
-      const res = await fetch('/api' + path + qs());
-      if (res.status === 401) { window.location.href = '/login'; return; }
-      return res.json();
+      showLoading();
+      try {
+        const res = await fetch('/api' + path + qs());
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        return res.json();
+      } finally {
+        hideLoading();
+      }
+    }
+
+    // Loading overlay: shown while any data requests are in flight. A counter
+    // (not a boolean) keeps the overlay up across the overlapping fetches that
+    // a single refresh() fans out, and during rapid successive refreshes.
+    let pendingRequests = 0;
+    function showLoading() {
+      pendingRequests++;
+      document.getElementById('loadingModal').classList.add('open');
+    }
+    function hideLoading() {
+      if (--pendingRequests <= 0) {
+        pendingRequests = 0;
+        document.getElementById('loadingModal').classList.remove('open');
+      }
     }
 
     // Quick range presets. null = all time (clears both bounds).
@@ -882,23 +954,14 @@
 
     // ── Render ─────────────────────────────────────────────────────
     async function refresh() {
-      const [summary, costTime, byModel, tools, hourly, byUser, sessions, events, users, teams, sessionWindows, weeklyWindows, billing, adminCost] =
-        await Promise.all([
-          api('/stats/summary'),
-          api('/stats/cost-over-time'),
-          api('/stats/by-model'),
-          api('/stats/tools'),
-          api('/stats/hourly-activity'),
-          api('/stats/by-user'),
-          api('/sessions'),
-          api('/events/recent'),
-          api('/users'),
-          api('/teams'),
-          api('/stats/session-windows'),
-          api('/stats/weekly-windows'),
-          api('/stats/billing-summary'),
-          api('/admin/per-user-cost'),
-        ]);
+      // Single consolidated fetch — the server resolves the filter once and
+      // runs the aggregate scans in one pass, instead of 14 endpoints each
+      // re-resolving the filter and re-scanning the tables.
+      const {
+        summary, costTime, byModel, tools, hourly, byUser,
+        sessions, events, users, teams, sessionWindows, weeklyWindows,
+        billing, adminCost,
+      } = await api('/dashboard');
 
       renderAudiencePanel(teams || [], users || []);
 
@@ -1342,6 +1405,8 @@
         const cls = tagClass[e.type] || 'tag-req';
         const sourceBadge = e.source === 'bedrock'
           ? ' <span class="tag" style="background:#f59e0b22;color:var(--orange)">bedrock</span>'
+          : e.source === 'litellm_gateway'
+          ? ' <span class="tag" style="background:#60a5fa22;color:#60a5fa">litellm</span>'
           : e.source === 'opencode'
           ? ' <span class="tag" style="background:#22c55e22;color:var(--green)">opencode</span>'
           : '';
@@ -1485,6 +1550,13 @@
         el.title = 'NO INGEST TOKEN, SUBMISSION IS PUBLIC';
       }
       el.style.display = 'inline-block';
+    }).catch(() => {});
+
+    // Deployed version footer
+    fetch('/api/version').then(r => r.json()).then(d => {
+      const el = document.getElementById('versionInfo');
+      if (!el) return;
+      el.textContent = 'v' + d.version + ' · ' + d.revision + (d.dirty ? ' (dirty)' : '');
     }).catch(() => {});
 
     async function logout() {

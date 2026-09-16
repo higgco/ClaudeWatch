@@ -5,11 +5,14 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "build-info": "node scripts/write-build-info.js",
+    "prestart": "node scripts/write-build-info.js"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.1019.0",
     "better-sqlite3": "^11.8.1",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "protobufjs": "^8.7.2"
   }
 }

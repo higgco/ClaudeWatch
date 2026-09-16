@@ -6,7 +6,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev \
   && apk del .build-deps
 COPY . .
-RUN mkdir -p data && chown -R node:node /app
+ARG BUILD_REVISION=unknown
+RUN printf '{"revision":"%s","builtAt":"%s"}\n' "$BUILD_REVISION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > build-info.json \
+  && mkdir -p data && chown -R node:node /app
 USER node
 EXPOSE 443
 CMD ["node", "src/server.js"]

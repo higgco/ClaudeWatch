@@ -60,7 +60,7 @@ pipeline {
 
     stage('Build') {
       steps {
-        sh 'docker build --platform linux/amd64 -t "$LOCAL_IMAGE" .'
+        sh 'docker build --platform linux/amd64 --build-arg BUILD_REVISION="$(git describe --tags --always --dirty)" -t "$LOCAL_IMAGE" .'
       }
     }
 
