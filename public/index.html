@@ -954,23 +954,14 @@
 
     // ── Render ─────────────────────────────────────────────────────
     async function refresh() {
-      const [summary, costTime, byModel, tools, hourly, byUser, sessions, events, users, teams, sessionWindows, weeklyWindows, billing, adminCost] =
-        await Promise.all([
-          api('/stats/summary'),
-          api('/stats/cost-over-time'),
-          api('/stats/by-model'),
-          api('/stats/tools'),
-          api('/stats/hourly-activity'),
-          api('/stats/by-user'),
-          api('/sessions'),
-          api('/events/recent'),
-          api('/users'),
-          api('/teams'),
-          api('/stats/session-windows'),
-          api('/stats/weekly-windows'),
-          api('/stats/billing-summary'),
-          api('/admin/per-user-cost'),
-        ]);
+      // Single consolidated fetch — the server resolves the filter once and
+      // runs the aggregate scans in one pass, instead of 14 endpoints each
+      // re-resolving the filter and re-scanning the tables.
+      const {
+        summary, costTime, byModel, tools, hourly, byUser,
+        sessions, events, users, teams, sessionWindows, weeklyWindows,
+        billing, adminCost,
+      } = await api('/dashboard');
 
       renderAudiencePanel(teams || [], users || []);
 
